@@ -28,12 +28,17 @@ import scala.{Tuple2 => &}
 import os.copy
 
 
-trait FTBParams extends HasXSParameter with HasBPUConst {
+trait FTBParams extends HasXSParameter with HasBPUConst  with HasBPUParameter{
+
   val numEntries = FtbSize
   val numWays    = FtbWays
-  val numSets    = numEntries/numWays // 512
-  val tagSize    = 20
+  val numSets    = 512 // 512
+  val tagSize    = 10
+  val ctrBits    = 3
+  val ITTageNTables = ITTageTableInfos.size
+  val TickWidth = 8
 
+  val indirEntriesWays = 8
 
 
   val TAR_STAT_SZ = 2
@@ -42,7 +47,7 @@ trait FTBParams extends HasXSParameter with HasBPUConst {
   def TAR_UDF = 2.U(TAR_STAT_SZ.W)
 
   def BR_OFFSET_LEN = 12
-  def JMP_OFFSET_LEN = 20
+  def JMP_OFFSET_LEN = 24
 
   def FTBCLOSE_THRESHOLD_SZ = log2Ceil(500)
   def FTBCLOSE_THRESHOLD = 500.U(FTBCLOSE_THRESHOLD_SZ.W) //can be modified
@@ -189,6 +194,9 @@ class FTBEntry(implicit p: Parameters) extends FTBEntry_part with FTBParams with
   val brSlots = Vec(numBrSlot, new FtbSlot(BR_OFFSET_LEN))
 
   val tailSlot = new FtbSlot(JMP_OFFSET_LEN, Some(BR_OFFSET_LEN))
+
+  val ctr = UInt(ctrBits.W)
+  val u   = Bool()
 
   // Partial Fall-Through Address
   val pftAddr     = UInt(log2Up(PredictWidth).W)
@@ -419,20 +427,44 @@ class FTBEntryWithTag(implicit p: Parameters) extends XSBundle with FTBParams wi
 }
 
 class FTBMeta(implicit p: Parameters) extends XSBundle with FTBParams {
-  val writeWay = UInt(log2Ceil(numWays).W)
+  val writeWay = UInt(log2Ceil(ITTageNTables).W)
   val hit = Bool()
   val pred_cycle = if (!env.FPGAPlatform) Some(UInt(64.W)) else None
+  val indir = Bool()
+  val provider = ValidUndirectioned(UInt(log2Ceil(ITTageNTables).W))
+  val altProvider = ValidUndirectioned(UInt(log2Ceil(ITTageNTables).W))
+  val altDiffers = Bool()
+  val providerU = Bool()
+  val providerCtr = UInt(ctrBits.W)
+  val altProviderCtr = UInt(ctrBits.W)
+  val allocate = ValidUndirectioned(UInt(log2Ceil(ITTageNTables).W))
+  val providerTarget = UInt(VAddrBits.W)
+  val altProviderTarget = UInt(VAddrBits.W)
 }
 
 object FTBMeta {
-  def apply(writeWay: UInt, hit: Bool, pred_cycle: UInt)(implicit p: Parameters): FTBMeta = {
+  def apply(writeWay: UInt, hit: Bool, pred_cycle: UInt,indir:Bool)(implicit p: Parameters): FTBMeta = {
     val e = Wire(new FTBMeta)
     e.writeWay := writeWay
     e.hit := hit
     e.pred_cycle.map(_ := pred_cycle)
+    e.indir := indir
     e
   }
 }
+
+// indir
+class FTBReq(implicit p: Parameters) extends XSBundle with FTBParams with BPUUtils{
+  val pc = UInt(VAddrBits.W)
+  val folded_hist = new AllFoldedHistories(foldedGHistInfos)
+  val indir_valid = Bool()
+} 
+
+class FTBUpdate(implicit p: Parameters) extends XSBundle with FTBParams with BPUUtils{
+  val pc = UInt(VAddrBits.W)
+  val ghist = UInt(HistoryLength.W)
+  val indir_valid = Bool()
+} 
 
 // class UpdateQueueEntry(implicit p: Parameters) extends XSBundle with FTBParams {
 //   val pc = UInt(VAddrBits.W)
@@ -457,48 +489,115 @@ class FTB(implicit p: Parameters) extends BasePredictor with FTBParams with BPUU
   override val meta_size = WireInit(0.U.asTypeOf(new FTBMeta)).getWidth
 
   val ftbAddr = new TableAddr(log2Up(numSets), 1)
+  def inc_ctr(ctr: UInt, taken: Bool): UInt = satUpdate(ctr, ctrBits, taken)
 
-  class FTBBank(val numSets: Int, val nWays: Int) extends XSModule with BPUUtils {
+  class FTBBank(val numSets: Int, val nWays: Int,val nRows:Int,val histLen:Int,val tagLen:Int,val tableIdx: Int) extends XSModule with BPUUtils with HasFoldedHistory {
     val io = IO(new Bundle {
       val s1_fire = Input(Bool())
 
       // when ftb hit, read_hits.valid is true, and read_hits.bits is OH of hit way
       // when ftb not hit, read_hits.valid is false, and read_hits is OH of allocWay
       // val read_hits = Valid(Vec(numWays, Bool()))
-      val req_pc = Flipped(DecoupledIO(UInt(VAddrBits.W)))
+      val req = Flipped(DecoupledIO(new FTBReq))
       val read_resp = Output(new FTBEntry)
-      val read_hits = Valid(UInt(log2Ceil(numWays).W))
+      val read_idx = Output(UInt(log2Ceil(numSets).W))
+      val read_hit = Bool()
 
-      val read_multi_entry = Output(new FTBEntry)
-      val read_multi_hits = Valid(UInt(log2Ceil(numWays).W))
+      // val read_multi_entry = Output(new FTBEntry)
+      // val read_multi_hits = Valid(UInt(log2Ceil(numWays).W))
 
-      val u_req_pc = Flipped(DecoupledIO(UInt(VAddrBits.W)))
-      val update_hits = Valid(UInt(log2Ceil(numWays).W))
+      val u_req = Flipped(DecoupledIO(new FTBUpdate))
+      val update_hit = Bool()
       val update_access = Input(Bool())
 
-      val update_pc = Input(UInt(VAddrBits.W))
+      // val update_req = Input(new FTBUpdate)
+      val update_idx = Input(UInt(log2Ceil(numSets).W))
       val update_write_data = Flipped(Valid(new FTBEntryWithTag))
-      val update_write_way = Input(UInt(log2Ceil(numWays).W))
-      val update_write_alloc = Input(Bool())
+      // val u_reset_u = Input(Bool())
+      // val update_write_way = Input(UInt(log2Ceil(numWays).W))
+      // val update_write_alloc = Input(Bool())
     })
 
     // Extract holdRead logic to fix bug that update read override predict read result
     val ftb = Module(new SRAMTemplate(new FTBEntryWithTag, set = numSets, way = numWays, shouldReset = true, holdRead = false, singlePort = true))
     val ftb_r_entries = ftb.io.r.resp.data.map(_.entry)
 
-    val pred_rdata   = HoldUnless(ftb.io.r.resp.data, RegNext(io.req_pc.valid && !io.update_access))
-    ftb.io.r.req.valid := io.req_pc.valid || io.u_req_pc.valid // io.s0_fire
-    ftb.io.r.req.bits.setIdx := Mux(io.u_req_pc.valid, ftbAddr.getIdx(io.u_req_pc.bits), ftbAddr.getIdx(io.req_pc.bits)) // s0_idx
+    val pred_rdata   = HoldUnless(ftb.io.r.resp.data, RegNext(io.req.valid && !io.update_access))
+    
 
-    assert(!(io.req_pc.valid && io.u_req_pc.valid))
+    def getUnhashedIdx(pc: UInt): UInt = pc >> instOffsetBits
+    // indir
+    require(histLen == 0 && tagLen == 0 || histLen != 0 && tagLen != 0)
+    val idxFhInfo = (histLen, min(log2Ceil(nRows), histLen))
+    val tagFhInfo = (histLen, min(histLen, tagLen))
+    val altTagFhInfo = (histLen, min(histLen, tagLen-1))
+    val allFhInfos = Seq(idxFhInfo, tagFhInfo, altTagFhInfo)
 
-    io.req_pc.ready := ftb.io.r.req.ready
-    io.u_req_pc.ready := ftb.io.r.req.ready
+    def getFoldedHistoryInfo = allFhInfos.filter(_._1 >0).toSet
 
-    val req_tag = RegEnable(ftbAddr.getTag(io.req_pc.bits)(tagSize-1, 0), io.req_pc.valid)
-    val req_idx = RegEnable(ftbAddr.getIdx(io.req_pc.bits), io.req_pc.valid)
+    def compute_tag_and_hash(unhashed_idx: UInt, allFh: AllFoldedHistories) = {
+      if (histLen > 0) {
+        val idx_fh = allFh.getHistWithInfo(idxFhInfo).folded_hist
+        val tag_fh = allFh.getHistWithInfo(tagFhInfo).folded_hist
+        val alt_tag_fh = allFh.getHistWithInfo(altTagFhInfo).folded_hist
+        // require(idx_fh.getWidth == log2Ceil(nRows))
+        val idx = (unhashed_idx ^ idx_fh)(log2Ceil(nRows)-1, 0)
+        val tag = ((unhashed_idx >> log2Ceil(nRows)) ^ tag_fh ^ (alt_tag_fh << 1)) (tagLen - 1, 0)
+        (idx, tag)
+      }
+      else {
+        require(tagLen == 0)
+        (unhashed_idx(log2Ceil(nRows)-1, 0), 0.U)
+      }
+    }
 
-    val u_req_tag = RegEnable(ftbAddr.getTag(io.u_req_pc.bits)(tagSize-1, 0), io.u_req_pc.valid)
+    val update_folded_hist = WireInit(0.U.asTypeOf(new AllFoldedHistories(foldedGHistInfos)))
+
+    update_folded_hist.getHistWithInfo(idxFhInfo).folded_hist := compute_folded_ghist(io.u_req.bits.ghist, log2Ceil(nRows))
+    update_folded_hist.getHistWithInfo(tagFhInfo).folded_hist := compute_folded_ghist(io.u_req.bits.ghist, tagLen)
+    update_folded_hist.getHistWithInfo(altTagFhInfo).folded_hist := compute_folded_ghist(io.u_req.bits.ghist, tagLen-1)
+    dontTouch(update_folded_hist)
+    val (u_indir_idx, u_indir_tag) = compute_tag_and_hash(getUnhashedIdx(io.u_req.bits.pc), update_folded_hist)
+
+
+
+
+    val s0_valid = io.req.valid
+    val s0_pc = io.req.bits.pc
+    val s0_indir_valid = io.req.bits.indir_valid
+    val s0_unhashed_idx = getUnhashedIdx(io.req.bits.pc)
+    val (s0_indir_idx,s0_indir_tag) = compute_tag_and_hash(s0_unhashed_idx, io.req.bits.folded_hist)
+    val s1_valid = RegNext(s0_valid)
+
+    val s0_idx = ftbAddr.getIdx(io.req.bits.pc)
+    val s0_tag = ftbAddr.getTag(io.req.bits.pc)(tagSize-1, 0)
+
+    // update to do
+    val u_idx = ftbAddr.getIdx(io.u_req.bits.pc)
+    val u_tag = ftbAddr.getTag(io.u_req.bits.pc)(tagSize-1, 0)
+    val u_real_idx = Mux(io.u_req.bits.indir_valid,u_indir_idx,u_idx)
+    val u_real_tag = Mux(io.u_req.bits.indir_valid,u_indir_tag,u_tag)
+
+    val real_idx = Mux(s0_indir_valid,s0_indir_idx,s0_idx)
+    val real_tag = Mux(s0_indir_valid,s0_indir_tag,s0_tag)
+    
+    ftb.io.r.req.valid := io.req.valid || io.u_req.valid // io.s0_fire
+    ftb.io.r.req.bits.setIdx := Mux(io.u_req.valid, u_real_idx, real_idx) // s0_idx
+
+    assert(!(io.req.valid && io.u_req.valid))
+
+
+
+
+
+
+    io.req.ready := ftb.io.r.req.ready
+    io.u_req.ready := ftb.io.r.req.ready
+
+    val req_tag = RegEnable(real_tag, io.req.valid)
+    // val req_idx = RegEnable(real_idx, io.req.valid)
+
+    val u_req_tag = RegEnable(u_real_tag, io.u_req.valid)
 
     val read_entries = pred_rdata.map(_.entry)
     val read_tags    = pred_rdata.map(_.tag)
@@ -506,39 +605,23 @@ class FTB(implicit p: Parameters) extends BasePredictor with FTBParams with BPUU
     val total_hits = VecInit((0 until numWays).map(b => read_tags(b) === req_tag && read_entries(b).valid && io.s1_fire))
     val hit = total_hits.reduce(_||_)
     // val hit_way_1h = VecInit(PriorityEncoderOH(total_hits))
-    val hit_way = OHToUInt(total_hits)
+    // val hit_way = OHToUInt(total_hits)
 
-    //There may be two hits in the four paths of the ftbBank, and the OHToUInt will fail.
-    //If there is a redirect in s2 at this time, the wrong FTBEntry will be used to calculate the target,
-    //resulting in an address error and affecting performance.
-    //The solution is to select a hit entry during multi hit as the entry for s2.
-    //Considering timing, use this entry in s3 and trigger s3-redirect.
-    val total_hits_reg = RegEnable(total_hits, io.s1_fire)
-    val read_entries_reg = read_entries.map(w => RegEnable(w, io.s1_fire))
-
-    val multi_hit = VecInit((0 until numWays).map{
-      i => (0 until numWays).map(j => {
-        if(i < j) total_hits_reg(i) && total_hits_reg(j)
-        else false.B
-      }).reduce(_||_)
-    }).reduce(_||_)
-    val multi_way = PriorityMux(Seq.tabulate(numWays)(i => ((total_hits_reg(i)) -> i.asUInt(log2Ceil(numWays).W))))
-    val multi_hit_selectEntry = PriorityMux(Seq.tabulate(numWays)(i => ((total_hits_reg(i)) -> read_entries_reg(i))))
 
     //Check if the entry read by ftbBank is legal.
-    for (n <- 0 to numWays -1 ) {
-      val req_pc_reg = RegEnable(io.req_pc.bits, io.req_pc.valid)
-      val ftb_entry_fallThrough = read_entries(n).getFallThrough(req_pc_reg)
-      when(read_entries(n).valid && total_hits(n) && io.s1_fire){
-        assert(req_pc_reg + (2*PredictWidth).U >= ftb_entry_fallThrough, s"FTB sram entry in way${n} fallThrough address error!")
-      }
-    }
+    // for (n <- 0 to numWays -1 ) {
+    //   val req_pc_reg = RegEnable(io.req.bits.pc, io.req.valid)
+    //   val ftb_entry_fallThrough = read_entries(n).getFallThrough(req_pc_reg)
+    //   when(read_entries(n).valid && total_hits(n) && io.s1_fire){
+    //     assert(req_pc_reg + (2*PredictWidth).U >= ftb_entry_fallThrough, s"FTB sram entry in way${n} fallThrough address error!")
+    //   }
+    // }
 
     val u_total_hits = VecInit((0 until numWays).map(b =>
         ftb.io.r.resp.data(b).tag === u_req_tag && ftb.io.r.resp.data(b).entry.valid && RegNext(io.update_access)))
     val u_hit = u_total_hits.reduce(_||_)
     // val hit_way_1h = VecInit(PriorityEncoderOH(total_hits))
-    val u_hit_way = OHToUInt(u_total_hits)
+    // val u_hit_way = OHToUInt(u_total_hits)
 
     // assert(PopCount(total_hits) === 1.U || PopCount(total_hits) === 0.U)
     // assert(PopCount(u_total_hits) === 1.U || PopCount(u_total_hits) === 0.U)
@@ -547,77 +630,46 @@ class FTB(implicit p: Parameters) extends BasePredictor with FTBParams with BPUU
       XSPerfAccumulate(f"ftb_update_${n}_way_hit", PopCount(u_total_hits) === n.U)
     }
 
-    val replacer = ReplacementPolicy.fromString(Some("setplru"), numWays, numSets)
-    // val allocWriteWay = replacer.way(req_idx)
 
-    val touch_set = Seq.fill(1)(Wire(UInt(log2Ceil(numSets).W)))
-    val touch_way = Seq.fill(1)(Wire(Valid(UInt(log2Ceil(numWays).W))))
+    io.read_resp := read_entries(0) // Mux1H
+    io.read_hit := hit && s1_valid
+    io.read_idx := real_idx
 
-    val write_set = Wire(UInt(log2Ceil(numSets).W))
-    val write_way = Wire(Valid(UInt(log2Ceil(numWays).W)))
+    io.update_hit := u_hit
 
-    val read_set = Wire(UInt(log2Ceil(numSets).W))
-    val read_way = Wire(Valid(UInt(log2Ceil(numWays).W)))
+    // reset u
+    // val needReset = RegInit(false.B)
+    // val useful_can_reset = !(io.req.fire || io.update_write_data.valid) && needReset
+    // val (resetSet, resetFinish) = Counter(useful_can_reset, nRows)
+    // when(io.u_reset_u){
+    //   needReset := true.B
+    // }.elsewhen(resetFinish){
+    //   needReset := false
+    // }
 
-    read_set := req_idx
-    read_way.valid := hit
-    read_way.bits  := hit_way
 
-    // Read replacer access is postponed for 1 cycle
-    // this helps timing
-    touch_set(0) := Mux(write_way.valid, write_set, RegNext(read_set))
-    touch_way(0).valid := write_way.valid || RegNext(read_way.valid)
-    touch_way(0).bits := Mux(write_way.valid, write_way.bits, RegNext(read_way.bits))
 
-    replacer.access(touch_set, touch_way)
-
-    // Select the update allocate way
-    // Selection logic:
-    //    1. if any entries within the same index is not valid, select it
-    //    2. if all entries is valid, use replacer
-    def allocWay(valids: UInt, idx: UInt): UInt = {
-      if (numWays > 1) {
-        val w = Wire(UInt(log2Up(numWays).W))
-        val valid = WireInit(valids.andR)
-        w := Mux(valid, replacer.way(idx), PriorityEncoder(~valids))
-        w
-      } else {
-        val w = WireInit(0.U(log2Up(numWays).W))
-        w
-      }
-    }
-
-    io.read_resp := Mux1H(total_hits, read_entries) // Mux1H
-    io.read_hits.valid := hit
-    io.read_hits.bits := hit_way
-
-    io.read_multi_entry := multi_hit_selectEntry
-    io.read_multi_hits.valid := multi_hit
-    io.read_multi_hits.bits := multi_way
-
-    io.update_hits.valid := u_hit
-    io.update_hits.bits := u_hit_way
 
     // Update logic
-    val u_valid = io.update_write_data.valid
-    val u_data = io.update_write_data.bits
-    val u_idx = ftbAddr.getIdx(io.update_pc)
-    val allocWriteWay = allocWay(RegNext(VecInit(ftb_r_entries.map(_.valid))).asUInt, u_idx)
-    val u_way = Mux(io.update_write_alloc, allocWriteWay, io.update_write_way)
-    val u_mask = UIntToOH(u_way)
+    val update_valid = io.update_write_data.valid
+    val update_data = io.update_write_data.bits
+    val update_idx = io.update_idx
+    // val allocWriteWay = allocWay(RegNext(VecInit(ftb_r_entries.map(_.valid))).asUInt, u_idx)
+    // val u_way = Mux(io.update_write_alloc, allocWriteWay, io.update_write_way)
+    // val u_mask = UIntToOH(u_way)
 
-    for (i <- 0 until numWays) {
-      XSPerfAccumulate(f"ftb_replace_way$i", u_valid && io.update_write_alloc && u_way === i.U)
-      XSPerfAccumulate(f"ftb_replace_way${i}_has_empty", u_valid && io.update_write_alloc && !ftb_r_entries.map(_.valid).reduce(_&&_) && u_way === i.U)
-      XSPerfAccumulate(f"ftb_hit_way$i", hit && !io.update_access && hit_way === i.U)
-    }
+    // for (i <- 0 until numWays) {
+    //   XSPerfAccumulate(f"ftb_replace_way$i", u_valid && io.update_write_alloc && u_way === i.U)
+    //   XSPerfAccumulate(f"ftb_replace_way${i}_has_empty", u_valid && io.update_write_alloc && !ftb_r_entries.map(_.valid).reduce(_&&_) && u_way === i.U)
+    //   XSPerfAccumulate(f"ftb_hit_way$i", hit && !io.update_access && hit_way === i.U)
+    // }
 
-    ftb.io.w.apply(u_valid, u_data, u_idx, u_mask)
+    ftb.io.w.apply(update_valid, update_data, update_idx,true.B)
 
     // for replacer
-    write_set := u_idx
-    write_way.valid := u_valid
-    write_way.bits := Mux(io.update_write_alloc, allocWriteWay, io.update_write_way)
+    // write_set := u_idx
+    // write_way.valid := u_valid
+    // write_way.bits := Mux(io.update_write_alloc, allocWriteWay, io.update_write_way)
 
     // print hit entry info
     Mux1H(total_hits, ftb.io.r.resp.data).display(true.B)
@@ -630,44 +682,215 @@ class FTB(implicit p: Parameters) extends BasePredictor with FTBParams with BPUU
   val s2_fauftb_ftb_entry_dup = io.s1_fire.map(f => RegEnable(io.fauftb_entry_in, f))
   val s2_fauftb_ftb_entry_hit_dup = io.s1_fire.map(f => RegEnable(io.fauftb_entry_hit_in, f))
 
-  val ftbBank = Module(new FTBBank(numSets, numWays))
+  // indir pred
+  val indirEntries = Seq.tabulate(indirEntriesWays)(w => RegInit(0.U(24.W)))
+  val indir_replacer = ReplacementPolicy.fromString("plru",indirEntriesWays)
+  val indir_replacer_touch_ways = Wire(Vec(2, Valid(UInt(log2Ceil(indirEntriesWays).W))))
+  val s0_indir_req_pc = s0_pc_dup(0)(24,1)
+  val s0_indir_hitWay = VecInit(indirEntries.map(_ === s0_indir_req_pc)).asUInt
+  val s1_indir_hitWay = RegEnable(s0_indir_hitWay,0.U,io.s0_fire(0))
+  val s0_indir_valid = s0_indir_hitWay.orR
+  val s1_indir_valid = RegEnable(s0_indir_valid,false.B,io.s0_fire(0))
+  val s2_indir_valid = RegEnable(s1_indir_valid,false.B,io.s1_fire(0))
+
+  indir_replacer_touch_ways(0).valid := RegNext(io.s1_fire(0) && s1_indir_valid)
+  indir_replacer_touch_ways(0).bits := RegEnable(s1_indir_hitWay,io.s1_fire(0) && s1_indir_valid)
+  
+  val s1_providerTarget    = Wire(UInt(VAddrBits.W))
+  val s1_altProviderTarget = Wire(UInt(VAddrBits.W))
+  val s1_provided          = Wire(Bool())
+  val s1_provider          = Wire(UInt(log2Ceil(ITTageNTables).W))
+  val s1_altProvided       = Wire(Bool())
+  val s1_altProvider       = Wire(UInt(log2Ceil(ITTageNTables).W))
+  val s1_providerU         = Wire(Bool())
+  val s1_providerCtr       = Wire(UInt(ctrBits.W))
+  val s1_altProviderCtr    = Wire(UInt(ctrBits.W))
+  val s1_altDiffers        = Wire(Bool())
+
+  val s2_providerTarget    = RegEnable(s1_providerTarget,io.s1_fire(0))
+  val s2_altProviderTarget = RegEnable(s1_altProviderTarget,io.s1_fire(0))
+  val s2_provided          = RegEnable(s1_provided,io.s1_fire(0))
+  val s2_provider          = RegEnable(s1_provider,io.s1_fire(0))
+  val s2_altProvided       = RegEnable(s1_altProvided,io.s1_fire(0))
+  val s2_altProvider       = RegEnable(s1_altProvider,io.s1_fire(0))
+  val s2_providerU         = RegEnable(s1_providerU,io.s1_fire(0))
+  val s2_providerCtr       = RegEnable(s1_providerCtr,io.s1_fire(0))
+  val s2_altProviderCtr    = RegEnable(s1_altProviderCtr,io.s1_fire(0))
+  val s2_altDiffers        = RegEnable(s1_altDiffers,io.s1_fire(0))
+
+  // val useAltOnNa = RegInit((1 << (UAONA_bits-1)).U(UAONA_bits.W))
+  val tickCtr = RegInit(0.U(TickWidth.W))
+
+
+
+  // indir
+  // val ftbBank = Module(new FTBBank(numSets, numWays))
+  val ftbBanks = ITTageTableInfos.zipWithIndex.map{
+    case ((nRows,histLen,tagLen),i) =>
+    val t = Module(new FTBBank(numSets,numWays,nRows,histLen,tagLen,i))
+    t.io.req.valid := io.s0_fire(0) && !s0_close_ftb_req
+    t.io.req.bits.pc := s0_pc_dup(0)
+    t.io.req.bits.folded_hist := io.in.bits.folded_hist(0)
+    t.io.req.bits.indir_valid := s0_indir_valid
+    t
+  }
+  override def getFoldedHistoryInfo = Some(ftbBanks.map(_.getFoldedHistoryInfo).reduce(_++_))
+
+
+  // not indir resp
+  val s1_resps = VecInit(ftbBanks.map(t => t.io.read_resp))
+  val s1_hits = VecInit(ftbBanks.map(t => t.io.read_hit))
+  val s1_hit_way = OHToUInt(s1_hits)
+  // val s1_hit = s1_hits.reduce(_||_) && io.ctrl.btb_enable
+  val s1_resp = Mux1H(s1_hits,s1_resps)
+
+  // ftb plru
+  val replacer = ReplacementPolicy.fromString(Some("setplru"), ITTageNTables, numSets)
+
+  val touch_set = Seq.fill(1)(Wire(UInt(log2Ceil(numSets).W)))
+  val touch_way = Seq.fill(1)(Wire(Valid(UInt(log2Ceil(ITTageNTables).W))))
+
+  val write_set = Wire(UInt(log2Ceil(numSets).W))
+  val write_way = Wire(Valid(UInt(log2Ceil(ITTageNTables).W)))
+
+  val read_set = Wire(UInt(log2Ceil(numSets).W))
+  val read_way = Wire(Valid(UInt(log2Ceil(ITTageNTables).W)))
+
+  read_set := ftbBanks(0).io.read_idx
+  read_way.valid := s1_hits.reduce(_||_) && !s1_indir_valid
+  read_way.bits  := s1_hit_way
+
+  // Read replacer access is postponed for 1 cycle
+  // this helps timing
+  touch_set(0) := Mux(write_way.valid, write_set, RegNext(read_set))
+  touch_way(0).valid := write_way.valid || RegNext(read_way.valid)
+  touch_way(0).bits := Mux(write_way.valid, write_way.bits, RegNext(read_way.bits))
+
+  replacer.access(touch_set, touch_way)
+
+  // Select the update allocate way
+  // Selection logic:
+  //    1. if any entries within the same index is not valid, select it
+  //    2. if all entries is valid, use replacer
+  def allocWay(valids: UInt, idx: UInt): UInt = {
+    if (numWays > 1) {
+      val w = Wire(UInt(log2Up(numWays).W))
+      val valid = WireInit(valids.andR)
+      w := Mux(valid, replacer.way(idx), PriorityEncoder(~valids))
+      w
+    } else {
+      val w = WireInit(0.U(log2Up(numWays).W))
+      w
+    }
+  }
+
+  class indirTableInfo(implicit p: Parameters) extends XSBundle with FTBParams with BPUUtils{
+    val tableIdx = UInt(log2Ceil(ITTageNTables).W)
+    val ctr = UInt(ctrBits.W)
+    val u = Bool()
+    val entry = new FTBEntry
+  }
+
+  // indir resp
+  val inputRes = VecInit(s1_resps.zipWithIndex.map{case (r,i) => {
+    val tableInfo = Wire(new indirTableInfo)
+    tableInfo.u := r.u
+    tableInfo.ctr := r.ctr
+    tableInfo.entry := r
+    tableInfo.tableIdx := i.U(log2Ceil(ITTageNTables).W)
+    SelectTwoInterRes(s1_hits(i),tableInfo)
+  }})
+  val selectedInfo = ParallelSelectTwo(inputRes.reverse)
+  val provided = selectedInfo.hasOne
+  val altProvided = selectedInfo.hasTwo
+
+  val providerInfo = selectedInfo.first
+  val altProviderInfo = selectedInfo.second
+  val providerNull = providerInfo.ctr === 0.U
+
+  val s1_indir_resp = Mux1H(Seq(
+    (provided && !(providerNull && altProvided), providerInfo.entry),
+    (altProvided && providerNull, altProviderInfo.entry),
+    (!provided, s1_resp)
+  ))
+  val s1_ftb_entry = Mux(s1_indir_valid,s1_indir_resp,s1_resp)
+  s1_provided := provided
+  s1_provider := providerInfo.tableIdx
+  s1_altProvided := altProvided
+  s1_altProvider := altProviderInfo.tableIdx
+  s1_providerU := providerInfo.u
+  s1_providerCtr := providerInfo.ctr
+  s1_altProviderCtr := altProviderInfo.ctr
+  s1_altDiffers := (providerInfo.entry.tailSlot.lower === altProviderInfo.entry.tailSlot.lower 
+  && providerInfo.entry.tailSlot.tarStat === altProviderInfo.entry.tailSlot.tarStat)
+  s1_providerTarget := providerInfo.entry.tailSlot.getTarget(s1_pc_dup(0))
+  s1_altProviderTarget := altProviderInfo.entry.tailSlot.getTarget(s1_pc_dup(0))
+
+  
 
   //for close ftb read_req
-  ftbBank.io.req_pc.valid := io.s0_fire(0) && !s0_close_ftb_req
-  ftbBank.io.req_pc.bits := s0_pc_dup(0)
+  // ftbBank.io.req_pc.valid := io.s0_fire(0) && !s0_close_ftb_req
+  // ftbBank.io.req_pc.bits := s0_pc_dup(0)
 
-  val s2_multi_hit = ftbBank.io.read_multi_hits.valid && io.s2_fire(0)
-  val s2_multi_hit_way = ftbBank.io.read_multi_hits.bits
-  val s2_multi_hit_entry = ftbBank.io.read_multi_entry
-  val s2_multi_hit_enable = s2_multi_hit && io.s2_redirect(0)
-  XSPerfAccumulate("ftb_s2_multi_hit", s2_multi_hit)
-  XSPerfAccumulate("ftb_s2_multi_hit_enable", s2_multi_hit_enable)
+  // val s2_multi_hit = ftbBank.io.read_multi_hits.valid && io.s2_fire(0)
+  // val s2_multi_hit_way = ftbBank.io.read_multi_hits.bits
+  // val s2_multi_hit_entry = ftbBank.io.read_multi_entry
+  // val s2_multi_hit_enable = s2_multi_hit && io.s2_redirect(0)
+  // XSPerfAccumulate("ftb_s2_multi_hit", s2_multi_hit)
+  // XSPerfAccumulate("ftb_s2_multi_hit_enable", s2_multi_hit_enable)
 
   //After closing ftb, the entry output from s2 is the entry of FauFTB cached in s1
   val btb_enable_dup = dup(RegNext(io.ctrl.btb_enable))
-  val s1_read_resp = Mux(s1_close_ftb_req, io.fauftb_entry_in, ftbBank.io.read_resp)
-  val s2_ftbBank_dup = io.s1_fire.map(f => RegEnable(ftbBank.io.read_resp, f))
+  val s1_read_resp = Mux(s1_close_ftb_req, io.fauftb_entry_in, s1_ftb_entry)
+  val s2_ftbBank_dup = io.s1_fire.map(f => RegEnable(s1_ftb_entry, f))
   val s2_ftb_entry_dup = dup(0.U.asTypeOf(new FTBEntry))
   for(((s2_fauftb_entry, s2_ftbBank_entry), s2_ftb_entry) <-
     s2_fauftb_ftb_entry_dup zip s2_ftbBank_dup zip s2_ftb_entry_dup){
       s2_ftb_entry := Mux(s2_close_ftb_req, s2_fauftb_entry, s2_ftbBank_entry)
   }
-  val s3_ftb_entry_dup = io.s2_fire.zip(s2_ftb_entry_dup).map {case (f, e) => RegEnable(Mux(s2_multi_hit_enable, s2_multi_hit_entry, e), f)}
+  val s3_ftb_entry_dup = io.s2_fire.zip(s2_ftb_entry_dup).map {case (f, e) => RegEnable( e, f)}
 
   //After closing ftb, the hit output from s2 is the hit of FauFTB cached in s1.
   //s1_hit is the ftbBank hit.
-  val s1_hit = Mux(s1_close_ftb_req, false.B, ftbBank.io.read_hits.valid && io.ctrl.btb_enable)
+  val s1_hit = Mux(s1_close_ftb_req, false.B, s1_hits.reduce(_||_) && io.ctrl.btb_enable)
   val s2_ftb_hit_dup = io.s1_fire.map(f => RegEnable(s1_hit, 0.B, f))
   val s2_hit_dup = dup(0.U.asTypeOf(Bool()))
   for(((s2_fauftb_hit, s2_ftb_hit), s2_hit) <-
     s2_fauftb_ftb_entry_hit_dup zip s2_ftb_hit_dup zip s2_hit_dup){
       s2_hit := Mux(s2_close_ftb_req, s2_fauftb_hit, s2_ftb_hit)
   }
-  val s3_hit_dup = io.s2_fire.zip(s2_hit_dup).map {case (f, h) => RegEnable(Mux(s2_multi_hit_enable, s2_multi_hit, h), 0.B, f)}
-  val s3_mult_hit_dup = io.s2_fire.map(f => RegEnable(s2_multi_hit_enable,f))
-  val writeWay = Mux(s1_close_ftb_req, 0.U, ftbBank.io.read_hits.bits)
-  val s2_ftb_meta = RegEnable(FTBMeta(writeWay.asUInt, s1_hit, GTimer()).asUInt, io.s1_fire(0))
-  val s2_multi_hit_meta = FTBMeta(s2_multi_hit_way.asUInt, s2_multi_hit, GTimer()).asUInt
+  val s3_hit_dup = io.s2_fire.zip(s2_hit_dup).map {case (f, h) => RegEnable( h, 0.B, f)}
+  // val s3_mult_hit_dup = io.s2_fire.map(f => RegEnable(s2_multi_hit_enable,f))
+  val writeWay = Mux(s1_close_ftb_req, 0.U, s1_hit_way)
+
+  val s2_ftb_meta = WireInit(0.U.asTypeOf(new FTBMeta))
+  s2_ftb_meta.writeWay := RegEnable(writeWay.asUInt,io.s1_fire(0))
+  s2_ftb_meta.hit := RegEnable(s1_hit,io.s1_fire(0))
+  s2_ftb_meta.pred_cycle.map(_ := RegEnable(GTimer(),io.s1_fire(0))) 
+  s2_ftb_meta.indir := RegEnable(s1_indir_valid,io.s1_fire(0))
+  s2_ftb_meta.provider.valid := s2_provided
+  s2_ftb_meta.provider.bits  := s2_provider
+  s2_ftb_meta.altProvider.valid := s2_altProvided
+  s2_ftb_meta.altProvider.bits := s2_altProvider
+  s2_ftb_meta.altDiffers := s2_altDiffers
+  s2_ftb_meta.providerU := s2_providerU
+  s2_ftb_meta.providerCtr := s2_providerCtr
+  s2_ftb_meta.altProviderCtr := s2_altProviderCtr
+  s2_ftb_meta.providerTarget := s2_providerTarget
+  s2_ftb_meta.altProviderTarget := s2_altProviderTarget
+  val s1_allocatableSlots = VecInit(s1_resps.map(r => !r.valid && !r.u)).asUInt &
+    ~(LowerMask(UIntToOH(s2_provider), ITTageNTables) & Fill(ITTageNTables, s2_provided.asUInt))
+  val s1_allocLFSR   = random.LFSR(width = 15)(ITTageNTables - 1, 0)
+  val s1_firstEntry  = PriorityEncoder(s1_allocatableSlots)
+  val s1_maskedEntry = PriorityEncoder(s1_allocatableSlots & s1_allocLFSR)
+  val s1_allocEntry  = Mux(s1_allocatableSlots(s1_maskedEntry), s1_maskedEntry, s1_firstEntry)
+  val s2_allocatableSlots = RegEnable(s1_allocatableSlots, io.s1_fire(0))
+  val s2_allocEntry  = RegEnable(s1_allocEntry, io.s1_fire(0))
+  s2_ftb_meta.allocate.valid := s2_allocatableSlots
+  s2_ftb_meta.allocate.bits  := s2_allocEntry
+  val s2_ftb_meta_UInt = RegEnable(s2_ftb_meta.asUInt, io.s1_fire(0))
+
+  // val s2_multi_hit_meta = FTBMeta(s2_multi_hit_way.asUInt, s2_multi_hit, GTimer(),s2_indir_valid).asUInt
 
   //Consistent count of entries for fauftb and ftb
   val fauftb_ftb_entry_consistent_counter = RegInit(0.U(FTBCLOSE_THRESHOLD_SZ.W))
@@ -680,9 +903,11 @@ class FTB(implicit p: Parameters) extends BasePredictor with FTBParams with BPUU
     fauftb_ftb_entry_consistent_counter := 0.U
   }
 
-  when((fauftb_ftb_entry_consistent_counter >= FTBCLOSE_THRESHOLD) && io.s0_fire(0)){
-    s0_close_ftb_req := true.B
-  }
+
+  // off
+  // when((fauftb_ftb_entry_consistent_counter >= FTBCLOSE_THRESHOLD) && io.s0_fire(0)){
+  //   s0_close_ftb_req := true.B
+  // }
 
   //Clear counter during false_hit or ifuRedirect
   val ftb_false_hit = WireInit(false.B)
@@ -727,13 +952,13 @@ class FTB(implicit p: Parameters) extends BasePredictor with FTBParams with BPUU
   }
 
   io.out.s3.full_pred.zip(s3_hit_dup).map {case (fp, h) => fp.hit := h}
-  io.out.s3.full_pred.zip(s3_mult_hit_dup).map {case (fp, m) => fp.multiHit := m}
+  // io.out.s3.full_pred.zip(s3_mult_hit_dup).map {case (fp, m) => fp.multiHit := m}
   for (full_pred & s3_ftb_entry & s3_pc & s2_pc & s2_fire <-
     io.out.s3.full_pred zip s3_ftb_entry_dup zip s3_pc_dup zip s2_pc_dup zip io.s2_fire)
       full_pred.fromFtbEntry(s3_ftb_entry, s3_pc.getAddr(), Some((s2_pc.getAddr(), s2_fire)))
 
   io.out.last_stage_ftb_entry := s3_ftb_entry_dup(0)
-  io.out.last_stage_meta := RegEnable(Mux(s2_multi_hit_enable, s2_multi_hit_meta, s2_ftb_meta), io.s2_fire(0))
+  io.out.last_stage_meta := RegEnable( s2_ftb_meta_UInt, io.s2_fire(0))
   io.out.s1_ftbCloseReq := s1_close_ftb_req
   io.out.s1_uftbHit := io.fauftb_entry_hit_in
   val s1_uftbHasIndirect = io.fauftb_entry_in.jmpValid &&
@@ -755,48 +980,234 @@ class FTB(implicit p: Parameters) extends BasePredictor with FTBParams with BPUU
 
   val u_meta = update.meta.asTypeOf(new FTBMeta)
   val u_valid = io.update.valid && !io.update.bits.old_entry
+  val u_indir_valid =
+  update.is_jalr && !update.is_ret && io.update.valid 
 
   val (_, delay2_pc) = DelayNWithValid(update.pc, u_valid, 2)
   val (_, delay2_entry) = DelayNWithValid(update.ftb_entry, u_valid, 2)
+  val (_, delay2_ghist) = DelayNWithValid(update.ghist, u_valid, 2)
+  val (_, delay2_indir) = DelayNWithValid(u_indir_valid, u_valid, 2)
 
+
+
+  val updateMask      = WireInit(0.U.asTypeOf(Vec(ITTageNTables, Bool())))
+  val updateUMask     = WireInit(0.U.asTypeOf(Vec(ITTageNTables, Bool())))
+  val updateResetU    = WireInit(false.B)
+  val updateCorrect   = Wire(Vec(ITTageNTables, Bool()))
+  val updateTarget    = Wire(Vec(ITTageNTables, UInt(VAddrBits.W)))
+  val updateOldTarget = Wire(Vec(ITTageNTables, UInt(VAddrBits.W)))
+  val updateAlloc     = Wire(Vec(ITTageNTables, Bool()))
+  val updateOldCtr    = Wire(Vec(ITTageNTables, UInt(ctrBits.W)))
+  val updateU         = Wire(Vec(ITTageNTables, Bool()))
+  updateCorrect   := DontCare
+  updateTarget  := DontCare
+  updateOldTarget  := DontCare
+  updateAlloc   := DontCare
+  updateOldCtr  := DontCare
+  updateU       := DontCare
+
+   val updateMisPred = update.mispred_mask(numBr)
 
   val update_now = u_valid && u_meta.hit
   val update_need_read = u_valid && !u_meta.hit
   // stall one more cycle because we use a whole cycle to do update read tag hit
-  io.s1_ready := ftbBank.io.req_pc.ready && !(update_need_read) && !RegNext(update_need_read)
+  io.s1_ready := ftbBanks.map(_.io.req.ready).reduce(_&&_) && !(update_need_read) && !RegNext(update_need_read)
 
-  ftbBank.io.u_req_pc.valid := update_need_read
-  ftbBank.io.u_req_pc.bits := update.pc
+  // ftbBank.io.u_req.valid := update_need_read
+  // ftbBank.io.u_req.bits.pc := update.pc
+  ftbBanks.map{ t => {
+      t.io.u_req.valid := update_need_read
+      t.io.u_req.bits.pc := update.pc
+      t.io.u_req.bits.ghist := update.ghist
+      t.io.u_req.bits.indir_valid := u_indir_valid
+    }
+  }
+
+  // indir
+  val u_indir_alloc_way = indir_replacer.way 
+  val u_indir_alloc_way_oh = UIntToOH(u_indir_alloc_way)
+  val u_indir_alloc_valid = !u_meta.indir && io.update.valid && update.is_jalr
+  val u_indir_ways_write_valid = VecInit((0 until indirEntriesWays).map(w => u_indir_alloc_way_oh(w).asBool && u_indir_alloc_valid))
+  val indir_correct = u_meta.indir === update.is_jalr && io.update.valid && update.is_jalr
+  XSPerfAccumulate("indir_total", io.update.valid && update.is_jalr)
+  XSPerfAccumulate("indir_pred_correct", indir_correct)
+
+  
+  val u_indir_pc = update.pc(24,1)
+  for(w <- 0 until indirEntriesWays){
+    when(u_indir_ways_write_valid(w)){
+      indirEntries(w) := u_indir_pc
+    }
+  }
+
+
+  indir_replacer_touch_ways(1).valid := RegNext(u_indir_alloc_valid)
+  indir_replacer_touch_ways(1).bits  := u_indir_alloc_way
+
+  indir_replacer.access(indir_replacer_touch_ways)
+
+  val updateRealTarget = update.full_target  
+  when(u_indir_valid){
+    when(u_meta.provider.valid){
+      val provider = u_meta.provider.bits
+      val altProvider = u_meta.altProvider.bits
+      val usedAltpred = u_meta.altProvider.valid && u_meta.providerCtr === 0.U
+      when(usedAltpred && updateMisPred){
+        updateMask(altProvider)    := true.B
+        updateUMask(altProvider)   := false.B
+        updateCorrect(altProvider) := false.B
+        updateOldCtr(altProvider)  := u_meta.altProviderCtr
+        updateAlloc(altProvider)   := false.B
+      }
+      updateMask(provider) := true.B     
+      updateUMask(provider)  := true.B
+      updateU(provider) := Mux(!u_meta.altDiffers, u_meta.providerU, !updateMisPred)
+      updateCorrect(provider)  := u_meta.providerTarget === updateRealTarget
+      updateTarget(provider) := updateRealTarget
+      updateOldTarget(provider) := u_meta.providerTarget
+      updateOldCtr(provider) := u_meta.providerCtr
+      updateAlloc(provider)  := false.B
+    }
+  }
+
+  val providerCorrect = u_meta.provider.valid && u_meta.providerTarget === updateRealTarget
+  val providerUnconf = u_meta.providerCtr === 0.U
+  when (u_indir_valid && updateMisPred && !(providerCorrect && providerUnconf)) {
+    val allocate = u_meta.allocate
+    tickCtr := satUpdate(tickCtr, TickWidth, !allocate.valid)
+    when (allocate.valid) {
+      updateMask(allocate.bits)  := true.B
+      updateCorrect(allocate.bits) := true.B // useless for alloc
+      updateTarget(allocate.bits) := updateRealTarget
+      updateAlloc(allocate.bits) := true.B
+      updateUMask(allocate.bits) := true.B
+      updateU(allocate.bits) := false.B
+    }
+  }
+
+  when (tickCtr === ((1 << TickWidth) - 1).U) {
+    tickCtr := 0.U
+    updateResetU := true.B
+  }
 
 
 
-  val ftb_write = Wire(new FTBEntryWithTag)
-  ftb_write.entry := Mux(update_now, update.ftb_entry, delay2_entry)
-  ftb_write.tag   := ftbAddr.getTag(Mux(update_now, update.pc, delay2_pc))(tagSize-1, 0)
+
+
+  def getUnhashedIdx(pc: UInt): UInt = pc >> instOffsetBits
+  val u_unhashed_idx = getUnhashedIdx(Mux(update_now, update.pc, delay2_pc))
+  val u_ghist = Mux(update_now,update.ghist,delay2_ghist)
+  val idx_and_tag = ITTageTableInfos.map{
+    case (nRows,histLen,tagLen) =>
+    val idxFhInfo = (histLen, min(log2Ceil(nRows), histLen))
+    val tagFhInfo = (histLen, min(histLen, tagLen))
+    val altTagFhInfo = (histLen, min(histLen, tagLen-1))
+    val allFhInfos = Seq(idxFhInfo, tagFhInfo, altTagFhInfo)
+    def compute_tag_and_hash(unhashed_idx: UInt, allFh: AllFoldedHistories) = {
+      if (histLen > 0) {
+        val idx_fh = allFh.getHistWithInfo(idxFhInfo).folded_hist
+        val tag_fh = allFh.getHistWithInfo(tagFhInfo).folded_hist
+        val alt_tag_fh = allFh.getHistWithInfo(altTagFhInfo).folded_hist
+        // require(idx_fh.getWidth == log2Ceil(nRows))
+        val idx = (unhashed_idx ^ idx_fh)(log2Ceil(nRows)-1, 0)
+        val tag = ((unhashed_idx >> log2Ceil(nRows)) ^ tag_fh ^ (alt_tag_fh << 1)) (tagLen - 1, 0)
+        (idx, tag)
+      }
+      else {
+        require(tagLen == 0)
+        (unhashed_idx(log2Ceil(nRows)-1, 0), 0.U)
+      }
+    }
+    def compute_folded_hist(hist: UInt, l: Int)(histLen: Int) = {
+    if (histLen > 0) {
+      val nChunks = (histLen + l - 1) / l
+      val hist_chunks = (0 until nChunks) map {i =>
+        hist(min((i+1)*l, histLen)-1, i*l)
+      }
+      ParallelXOR(hist_chunks)
+    }
+    else 0.U
+    }
+    val update_folded_hist = WireInit(0.U.asTypeOf(new AllFoldedHistories(foldedGHistInfos)))
+    update_folded_hist.getHistWithInfo(idxFhInfo).folded_hist := compute_folded_hist(u_ghist, log2Ceil(nRows))(histLen)
+    update_folded_hist.getHistWithInfo(tagFhInfo).folded_hist := compute_folded_hist(u_ghist, tagLen)(histLen)
+    update_folded_hist.getHistWithInfo(altTagFhInfo).folded_hist := compute_folded_hist(u_ghist, tagLen-1)(histLen)
+    dontTouch(update_folded_hist)
+    val (update_idx, update_tag) = compute_tag_and_hash(u_unhashed_idx, update_folded_hist)
+    (update_idx,update_tag)
+  }
+
+  val ftb_write = Wire(Vec(ITTageNTables,new FTBEntryWithTag))
+  val old_ctr = WireInit(update.ftb_entry.ctr)
+  val old_u = WireInit(update.ftb_entry.u)
+  val write_indir_valid = Mux(update_now, u_indir_valid, delay2_indir)
+
+  // ftb_write.entry := Mux(update_now, update.ftb_entry, delay2_entry)
+  // ftb_write.tag   := ftbAddr.getTag(Mux(update_now, update.pc, delay2_pc))(tagSize-1, 0)
+  ftb_write.zipWithIndex.map{
+    case (f,i) =>
+      f.entry := Mux(update_now, update.ftb_entry, delay2_entry)
+      f.tag   := Mux(write_indir_valid,idx_and_tag(i)._2,ftbAddr.getTag(Mux(update_now, update.pc, delay2_pc))(tagSize-1, 0))
+    //for u and ctr
+      when(u_indir_valid){
+        f.entry.ctr := Mux(updateMask(i) && updateAlloc(i),2.U,inc_ctr(old_ctr,updateMask(i) && updateCorrect(i)))
+        f.entry.u := Mux(updateMask(i),updateU(i),old_u)
+      }
+  
+  }
 
   val write_valid = update_now || DelayN(u_valid && !u_meta.hit, 2)
   val write_pc    = Mux(update_now, update.pc, delay2_pc)
+  val write_alloc = Mux(update_now,false.B,RegNext(!u_meta.hit))
+  val update_write_way = Mux(update_now, u_meta.writeWay, RegNext(u_meta.writeWay))
+  val allocWriteWay = allocWay(RegNext(VecInit(s1_resps.map(_.valid)).asUInt), ftbAddr.getIdx(Mux(update_now, update.pc, delay2_pc)))
+  val write_way_mask = UIntToOH(Mux(write_alloc,allocWriteWay,update_write_way))
 
-  ftbBank.io.update_write_data.valid := write_valid
-  ftbBank.io.update_write_data.bits := ftb_write
-  ftbBank.io.update_pc          := write_pc
-  ftbBank.io.update_write_way   := Mux(update_now, u_meta.writeWay, RegNext(ftbBank.io.update_hits.bits)) // use it one cycle later
-  ftbBank.io.update_write_alloc := Mux(update_now, false.B, RegNext(!ftbBank.io.update_hits.valid)) // use it one cycle later
-  ftbBank.io.update_access := u_valid && !u_meta.hit
-  ftbBank.io.s1_fire := io.s1_fire(0)
 
-  val ftb_write_fallThrough = ftb_write.entry.getFallThrough(write_pc)
-  when(write_valid){
-    assert(write_pc + (FetchWidth * 4).U >= ftb_write_fallThrough, s"FTB write_entry fallThrough address error!")
+  for(i <- 0 until ITTageNTables){
+    ftbBanks(i).io.update_write_data.valid := Mux(write_indir_valid,updateMask(i),write_valid && write_way_mask(i))
+    ftbBanks(i).io.update_write_data.bits := ftb_write(i)
+    ftbBanks(i).io.update_idx := Mux(write_indir_valid,idx_and_tag(i)._1,ftbAddr.getIdx(Mux(update_now, update.pc, delay2_pc)))
+    ftbBanks(i).io.update_access := u_valid && !u_meta.hit
+    ftbBanks(i).io.s1_fire := io.s1_fire(0)
   }
 
-  XSDebug("req_v=%b, req_pc=%x, ready=%b (resp at next cycle)\n", io.s0_fire(0), s0_pc_dup(0), ftbBank.io.req_pc.ready)
+
+  // ftb replace
+
+  val update_write_alloc = Mux(update_now, false.B, RegNext(!u_meta.hit))
+
+  write_set := ftbAddr.getIdx(Mux(update_now, update.pc, delay2_pc))
+  write_way.valid := write_valid && !write_indir_valid
+  write_way.bits := Mux(update_write_alloc, allocWriteWay, update_write_way)
+
+
+
+
+  // val ftb_write_fallThrough = ftb_write(0).entry.getFallThrough(write_pc)
+  // when(write_valid){
+  //   assert(write_pc + (FetchWidth * 4).U >= ftb_write_fallThrough, s"FTB write_entry fallThrough address error!")
+  // }
+
+  XSDebug("req_v=%b, req_pc=%x, ready=%b (resp at next cycle)\n", io.s0_fire(0), s0_pc_dup(0), ftbBanks.map(t=> t.io.req.ready).reduce(_&&_))
   XSDebug("s2_hit=%b, hit_way=%b\n", s2_hit_dup(0), writeWay.asUInt)
   XSDebug("s2_br_taken_mask=%b, s2_real_taken_mask=%b\n",
     io.in.bits.resp_in(0).s2.full_pred(0).br_taken_mask.asUInt, io.out.s2.full_pred(0).real_slot_taken_mask().asUInt)
   XSDebug("s2_target=%x\n", io.out.s2.getTarget(0))
 
   s2_ftb_entry_dup(0).display(true.B)
+
+  def pred_perf(name: String, cond: Bool)   = XSPerfAccumulate(s"${name}_at_pred", cond && io.s2_fire(3))
+  def commit_perf(name: String, cond: Bool) = XSPerfAccumulate(s"${name}_at_commit", cond && u_indir_valid)
+  def ftb_perf(name: String, pred_cond: Bool, commit_cond: Bool) = {
+    pred_perf(s"ftb_${name}", pred_cond)
+    commit_perf(s"ftb_${name}", commit_cond)
+  }
+
+
+  ftb_perf("provided", s2_provided, u_meta.provider.valid)
+  XSPerfAccumulate("ftb_indir_updated", u_indir_valid)
+
 
   XSPerfAccumulate("ftb_read_hits", RegNext(io.s0_fire(0)) && s1_hit)
   XSPerfAccumulate("ftb_read_misses", RegNext(io.s0_fire(0)) && !s1_hit)

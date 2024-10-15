@@ -99,7 +99,7 @@ case class XSCoreParameters
   RasSpecSize: Int = 32,
   RasCtrSize: Int = 3,
   CacheLineSize: Int = 512,
-  FtbWays: Int = 4,
+  FtbWays: Int = 1,
   TageTableInfos: Seq[Tuple3[Int,Int,Int]] =
   //       Sets  Hist   Tag
     Seq(( 4096,    8,    8),
@@ -108,11 +108,15 @@ case class XSCoreParameters
         ( 4096,  119,    8)),
   ITTageTableInfos: Seq[Tuple3[Int,Int,Int]] =
   //      Sets  Hist   Tag
-    Seq(( 256,    4,    9),
-        ( 256,    8,    9),
-        ( 512,   13,    9),
-        ( 512,   16,    9),
-        ( 512,   32,    9)),
+    // Seq(( 256,    4,    9),
+    //     ( 256,    8,    9),
+    //     ( 512,   13,    9),
+    //     ( 512,   16,    9),
+    //     ( 512,   32,    9)),
+    Seq(( 512,    4,    10),
+        ( 512,    8,    10),
+        ( 512,   16,    10),
+        ( 512,   32,    10)),
   SCNRows: Int = 512,
   SCNTables: Int = 4,
   SCCtrBits: Int = 6,
@@ -124,8 +128,8 @@ case class XSCoreParameters
     val uftb = Module(new FauFTB()(p))
     val tage = Module(new Tage_SC()(p))
     val ras = Module(new RAS()(p))
-    val ittage = Module(new ITTage()(p))
-    val preds = Seq(uftb, tage, ftb, ittage, ras)
+    // val ittage = Module(new ITTage()(p))
+    val preds = Seq(uftb, tage, ftb, ras)
     preds.map(_.io := DontCare)
 
     ftb.io.fauftb_entry_in  := uftb.io.fauftb_entry_out
@@ -134,8 +138,8 @@ case class XSCoreParameters
     uftb.io.in.bits.resp_in(0) := resp_in
     tage.io.in.bits.resp_in(0) := uftb.io.out
     ftb.io.in.bits.resp_in(0) := tage.io.out
-    ittage.io.in.bits.resp_in(0) := ftb.io.out
-    ras.io.in.bits.resp_in(0) := ittage.io.out
+    // ittage.io.in.bits.resp_in(0) := ftb.io.out
+    ras.io.in.bits.resp_in(0) := ftb.io.out
 
     (preds, ras.io.out)
   },
