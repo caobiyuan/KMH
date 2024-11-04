@@ -403,10 +403,10 @@ class DefaultConfig(n: Int = 1) extends Config(
 class WithNanhuV5Config extends Config((site, here, up) =>{
   case XSTileKey => up(XSTileKey).map(_.copy(
 
-    ITTageTableInfos = Seq(         // Default: 5table
-      ( 256,    8,    9),
-      ( 512,   32,    9)
-    ),
+    // ITTageTableInfos = Seq(         // Default: 5table
+    //   ( 256,    8,    9),
+    //   ( 512,   32,    9)
+    // ),
 
     IBufSize = 32,                  // Default: 48
     IBufNBank = 4,                  // Default: 6

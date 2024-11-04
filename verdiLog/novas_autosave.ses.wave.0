@@ -1,0 +1,80 @@
+Magic 271485
+Revision Verdi_U-2023.03
+
+; Window Layout <x> <y> <width> <height> <signalwidth> <valuewidth>
+viewPort 0 25 900 258 100 65
+
+; File list:
+; openDirFile [-d delimiter] [-s time_offset] [-rf auto_bus_rule_file] path_name file_name
+openDirFile -d / "" "/nfs/home/caobiyuan/KMH/build/2024-10-29@11:19:17.vcd" "/nfs/home/caobiyuan/KMH/build/2024-10-29@11:19:17.vcd.fsdb"
+
+; file time scale:
+; fileTimeScale ### s|ms|us|ns|ps
+
+; signal spacing:
+signalSpacing 5
+
+; windowTimeUnit is used for zoom, cursor & marker
+; waveform viewport range
+zoom 0.000000 4605.652935
+cursor 418.84315373766
+marker 0.000000
+
+; user define markers
+; userMarker time_pos marker_name color linestyle
+; visible top row signal index
+top 0
+; marker line index
+markerPos 5
+
+; event list
+; addEvent event_name event_expression
+; curEvent event_name
+
+
+
+COMPLEX_EVENT_BEGIN
+
+
+COMPLEX_EVENT_END
+
+
+
+; toolbar current search type
+; curSTATUS search_type
+curSTATUS ByChange
+
+
+addGroup "G1"
+activeDirFile "" "/nfs/home/caobiyuan/KMH/build/2024-10-29@11:19:17.vcd.fsdb"
+addSignal -h 15 -UNSIGNED -HEX /TOP/SimTop/l_soc/core_with_l2/core/frontend/bpu/predictors/io_in_bits_s0_pc_0[49:0]
+addSignal -h 15 -holdScope io_update_valid
+addSignal -h 15 -UNSIGNED -HEX -holdScope s1_pc_dup_0[49:0]
+addSignal -h 15 -UNSIGNED -HEX -holdScope io_out_s1_pc_0[49:0]
+addSignal -h 15 -UNSIGNED -HEX -holdScope io_perf_0_value[5:0]
+addGroup "G2"
+
+; getSignalForm Scope Hierarchy Status
+; active file of getSignalForm
+activeDirFile "" "/nfs/home/caobiyuan/KMH/build/2024-10-29@11:19:17.vcd.fsdb"
+
+GETSIGNALFORM_SCOPE_HIERARCHY_BEGIN
+getSignalForm close
+
+"/TOP"
+"/TOP/SimTop"
+"/TOP/SimTop/l_soc"
+"/TOP/SimTop/l_soc/core_with_l2"
+"/TOP/SimTop/l_soc/core_with_l2/core"
+"/TOP/SimTop/l_soc/core_with_l2/core/frontend"
+"/TOP/SimTop/l_soc/core_with_l2/core/frontend/bpu"
+
+SCOPE_LIST_BEGIN
+"/TOP"
+"/TOP/SimTop/l_soc/core_with_l2/core/frontend/bpu"
+"/TOP/SimTop/l_soc/core_with_l2/core/frontend/bpu/predictors"
+SCOPE_LIST_END
+
+GETSIGNALFORM_SCOPE_HIERARCHY_END
+
+
