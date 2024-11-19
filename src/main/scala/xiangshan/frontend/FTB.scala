@@ -38,7 +38,7 @@ trait FTBParams extends HasXSParameter with HasBPUConst  with HasBPUParameter{
   val ITTageNTables = ITTageTableInfos.size
   val TickWidth = 8
 
-  val indirEntriesWays = 16
+  val indirEntriesWays = 64
   def ctr_null(ctr: UInt, ctrBit: Int = ctrBits) = {
     ctr === 0.U
   }
@@ -608,7 +608,7 @@ class FTB(implicit p: Parameters) extends BasePredictor with FTBParams with BPUU
     val read_entries = pred_rdata.map(_.entry)
     val read_tags    = pred_rdata.map(_.tag)
 
-    val total_hits = VecInit((0 until numWays).map(b => read_tags(b) === real_tag && read_entries(b).valid && io.s1_fire))
+    val total_hits = VecInit((0 until numWays).map(b => read_tags(b) === req_tag && read_entries(b).valid && io.s1_fire))
     val hit = total_hits.reduce(_||_)
     // val hit_way_1h = VecInit(PriorityEncoderOH(total_hits))
     // val hit_way = OHToUInt(total_hits)
@@ -888,9 +888,9 @@ class FTB(implicit p: Parameters) extends BasePredictor with FTBParams with BPUU
   val s3_hit_dup = io.s2_fire.zip(s2_hit_dup).map {case (f, h) => RegEnable( h, 0.B, f)}
   // val s3_mult_hit_dup = io.s2_fire.map(f => RegEnable(s2_multi_hit_enable,f))
   val s1_writeWay = Mux(s1_close_ftb_req, 0.U, s1_hit_way)
-  val s2_writeWay = RegEnable(s1_hit_way,io.s1_fire(0))
+  val s2_writeWay = RegEnable(s1_writeWay,io.s1_fire(0))
 
-  val s2_ftb_meta = RegInit(0.U.asTypeOf(new FTBMeta))
+  val s2_ftb_meta = WireInit(0.U.asTypeOf(new FTBMeta))
   s2_ftb_meta.writeWay := s2_writeWay.asUInt
   s2_ftb_meta.hit := s2_ftb_hit_dup(0)
   s2_ftb_meta.pred_cycle.map(_ := GTimer())
@@ -1253,13 +1253,13 @@ class FTB(implicit p: Parameters) extends BasePredictor with FTBParams with BPUU
 
   // ftb replace
 
-  val updateMask_Muti = VecInit((0 until ITTageNTables).map{
-      i => (0 until ITTageNTables).map(j => {
-        if(i < j) updateMask(i) && updateMask(j)
-        else false.B
-      }).reduce(_||_)
-    }).reduce(_||_)
-  XSPerfAccumulate("updateMask_over_1",updateMask_Muti)
+  // val updateMask_Muti = VecInit((0 until ITTageNTables).map{
+  //     i => (0 until ITTageNTables).map(j => {
+  //       if(i < j) updateMask(i) && updateMask(j)
+  //       else false.B
+  //     }).reduce(_||_)
+  //   }).reduce(_||_)
+  // XSPerfAccumulate("updateMask_over_1",updateMask_Muti)
 
   // write_set := ftbAddr.getIdx(write_pc)
   // write_way.valid := write_valid
